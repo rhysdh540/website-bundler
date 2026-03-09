@@ -11,6 +11,10 @@ use tokio::time::Duration;
 use tower_http::services::{ServeDir, ServeFile};
 
 pub async fn run(opts: BuildOptions, addr: SocketAddr, debounce: u64) -> Result<()> {
+    unsafe {
+        std::env::set_var("DEV", "true");
+    }
+
     let debounce = Duration::from_millis(debounce);
 
     print!("building...");

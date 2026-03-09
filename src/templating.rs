@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 /// - content; if template, includes body, else error
 /// - if expr="...", elif expr="...", else, endif; self-explanatory conditionals
 /// - echo var="...", unset var="...", set var="..." val="..."; get/un/set variables
+/// - env.* is read-only in expressions (set/unset rejects writes to that namespace)
 #[derive(Debug, Clone)]
 pub struct Frontmatter {
     pub template: Option<String>,
@@ -59,13 +60,8 @@ impl Frontmatter {
             None => JsonMap::new(),
             Some(Value::Object(o)) => o.clone(),
             Some(_) => bail!("frontmatter.vars must be an object"),
-        }
-        .iter()
-        .map(|(k, v)| match v {
-            Value::String(s) => Ok((k.clone(), s.clone())),
-            _ => bail!("frontmatter.vars values must be strings"),
-        })
-        .collect::<Result<HashMap<_, _>>>()?;
+        };
+        let vars = parse_frontmatter_vars(&vars)?;
 
         let path = match parsed.get("path") {
             None => None,
@@ -236,39 +232,203 @@ fn resolve_vars(s: &str, vars: &HashMap<String, String>) -> String {
     result
 }
 
-fn evaluate_expression(expr: &str) -> bool {
+fn parse_frontmatter_vars(vars: &JsonMap<String, Value>) -> Result<HashMap<String, String>> {
+    let mut out = HashMap::new();
+    for (k, v) in vars {
+        if k.is_empty() {
+            bail!("frontmatter.vars keys cannot be empty");
+        }
+        flatten_frontmatter_var(k, v, &mut out)?;
+    }
+    Ok(out)
+}
+
+fn flatten_frontmatter_var(
+    path: &str,
+    value: &Value,
+    out: &mut HashMap<String, String>,
+) -> Result<()> {
+    match value {
+        Value::String(s) => {
+            ensure_legal(path)?;
+            out.insert(path.to_string(), s.clone());
+            Ok(())
+        }
+        Value::Object(map) => {
+            for (k, v) in map {
+                if k.is_empty() {
+                    bail!("frontmatter.vars keys cannot be empty");
+                }
+                let nested_path = format!("{path}.{k}");
+                flatten_frontmatter_var(&nested_path, v, out)?;
+            }
+            Ok(())
+        }
+        _ => bail!("frontmatter.vars values must be strings or objects"),
+    }
+}
+
+fn ensure_legal(var_name: &str) -> Result<()> {
+    if var_name.starts_with("env.") || var_name == "env" {
+        bail!("Cannot write to env variables: '{}'", var_name);
+    }
+    if var_name == "true" || var_name == "false" {
+        bail!("Cannot use reserved variable name: '{}'", var_name);
+    }
+    Ok(())
+}
+
+fn get_var(name: &str, vars: &HashMap<String, String>) -> Option<String> {
+    if let Some(env_name) = name.strip_prefix("env.") {
+        return std::env::var(env_name).ok();
+    }
+    vars.get(name).cloned()
+}
+
+fn parse_str_sq(s: &str) -> Result<String> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'\'' || bytes[bytes.len() - 1] != b'\'' {
+        bail!("String comparisons must use single-quoted strings");
+    }
+
+    let inner = &s[1..s.len() - 1];
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    let mut escaped = false;
+    while let Some(c) = chars.next() {
+        if escaped {
+            match c {
+                '\'' | '\\' => out.push(c),
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                _ => out.push(c),
+            }
+            escaped = false;
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+            continue;
+        }
+        out.push(c);
+    }
+    if escaped {
+        bail!("Invalid trailing escape in string literal");
+    }
+
+    Ok(out)
+}
+
+fn remove_parens(expr: &str) -> Option<&str> {
+    if !(expr.starts_with('(') && expr.ends_with(')')) {
+        return None;
+    }
+
+    let mut depth = 0i32;
+    let mut in_single_quote = false;
+    let mut escaped = false;
+
+    for (i, c) in expr.char_indices() {
+        if in_single_quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match c {
+                '\\' => escaped = true,
+                '\'' => in_single_quote = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match c {
+            '\'' => in_single_quote = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 && i != expr.len() - 1 {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if depth == 0 {
+        Some(expr[1..expr.len() - 1].trim())
+    } else {
+        None
+    }
+}
+
+fn evaluate_expr(expr: &str, vars: &HashMap<String, String>) -> Result<bool> {
     let expr = expr.trim();
     if expr.is_empty() {
-        return false;
+        return Ok(false);
     }
 
     if let Some(idx) = find_operator(expr, "||") {
-        return evaluate_expression(&expr[..idx]) || evaluate_expression(&expr[idx + 2..]);
+        return Ok(evaluate_expr(&expr[..idx], vars)? || evaluate_expr(&expr[idx + 2..], vars)?);
     }
 
     if let Some(idx) = find_operator(expr, "^") {
-        return evaluate_expression(&expr[..idx]) ^ evaluate_expression(&expr[idx + 1..]);
+        return Ok(evaluate_expr(&expr[..idx], vars)? ^ evaluate_expr(&expr[idx + 1..], vars)?);
     }
 
     if let Some(idx) = find_operator(expr, "&&") {
-        return evaluate_expression(&expr[..idx]) && evaluate_expression(&expr[idx + 2..]);
+        return Ok(evaluate_expr(&expr[..idx], vars)? && evaluate_expr(&expr[idx + 2..], vars)?);
     }
 
     if expr.starts_with('!') {
-        return !evaluate_expression(&expr[1..].trim_start());
+        return Ok(!evaluate_expr(expr[1..].trim_start(), vars)?);
     }
 
-    if expr.starts_with('(') && expr.ends_with(')') {
-        return evaluate_expression(&expr[1..expr.len() - 1].trim());
+    if let Some(inner) = remove_parens(expr) {
+        return evaluate_expr(inner, vars);
     }
 
-    expr != "false" && !expr.is_empty()
+    if let Some(idx) = find_operator(expr, "==") {
+        let left = expr[..idx].trim();
+        let right = expr[idx + 2..].trim();
+        if left.is_empty() || right.is_empty() {
+            bail!("Invalid comparison expression: '{expr}'");
+        }
+        let expected = parse_str_sq(right)?;
+        return Ok(get_var(left, vars).is_some_and(|actual| actual == expected));
+    }
+
+    if expr == "true" {
+        return Ok(true);
+    }
+    if expr == "false" {
+        return Ok(false);
+    }
+
+    Ok(get_var(expr, vars).is_some())
 }
 
 fn find_operator(expr: &str, op: &str) -> Option<usize> {
-    let mut depth = 0;
+    let mut depth = 0i32;
+    let mut in_single_quote = false;
+    let mut escaped = false;
+
     for (i, c) in expr.char_indices() {
+        if in_single_quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match c {
+                '\\' => escaped = true,
+                '\'' => in_single_quote = false,
+                _ => {}
+            }
+            continue;
+        }
+
         match c {
+            '\'' => in_single_quote = true,
             '(' => depth += 1,
             ')' => depth -= 1,
             _ if depth == 0 && expr[i..].starts_with(op) => return Some(i),
@@ -375,6 +535,7 @@ impl TemplateEngine {
     ) -> Result<()> {
         let var_name =
             get_param(params, "var").ok_or_else(|| anyhow!("set missing 'var' parameter"))?;
+        ensure_legal(var_name)?;
         let val = get_param(params, "val").ok_or_else(|| anyhow!("set missing 'val' parameter"))?;
         let resolved = resolve_vars(val, vars);
         vars.insert(var_name.to_string(), resolved);
@@ -388,6 +549,7 @@ impl TemplateEngine {
     ) -> Result<()> {
         let var_name =
             get_param(params, "var").ok_or_else(|| anyhow!("unset missing 'var' parameter"))?;
+        ensure_legal(var_name)?;
         vars.remove(var_name);
         Ok(())
     }
@@ -463,10 +625,9 @@ impl TemplateEngine {
 
         let first_tag = &tokens[start_idx];
         let (mut current_expr, mut current_start) = match first_tag {
-            Token::Tag { name, params } if name == "if" => (
-                get_param(params, "expr").map(|e| resolve_vars(e, vars)),
-                start_idx + 1,
-            ),
+            Token::Tag { name, params } if name == "if" => {
+                (get_param(params, "expr").map(str::to_owned), start_idx + 1)
+            }
             _ => bail!("handle_conditional_block must start with 'if' tag"),
         };
 
@@ -495,8 +656,7 @@ impl TemplateEngine {
                     if name == "else" {
                         current_expr = Some("true".to_string());
                     } else {
-                        current_expr =
-                            get_param(next_params, "expr").map(|e| resolve_vars(e, vars));
+                        current_expr = get_param(next_params, "expr").map(str::to_owned);
                     }
                     current_start = j + 1;
                 }
@@ -511,7 +671,7 @@ impl TemplateEngine {
 
         for (expr, start, end) in blocks {
             let should_render = match expr {
-                Some(e) => evaluate_expression(&e),
+                Some(e) => evaluate_expr(&e, vars)?,
                 None => true,
             };
             if should_render {
