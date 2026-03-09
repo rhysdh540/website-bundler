@@ -281,10 +281,118 @@ fn minify_css(css: String) -> Result<String> {
     Ok(out.code)
 }
 
+fn mk_parent(out_path: &Path) -> Result<()> {
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+fn output_min(
+    source_path: &Path,
+    out_path: &Path,
+    label: &str,
+    minifier: fn(String) -> Result<String>,
+) -> Result<()> {
+    let source = fs::read_to_string(source_path)
+        .with_context(|| format!("Failed to read {label}: {}", source_path.display()))?;
+    let transformed = match minifier(source.clone()) {
+        Ok(minified) => minified,
+        Err(err) => {
+            eprintln!(
+                "Failed to minify {} file {}: {err}",
+                label.to_lowercase(),
+                source_path.display()
+            );
+            source
+        }
+    };
+    fs::write(out_path, transformed)
+        .with_context(|| format!("Failed to write {}", out_path.display()))?;
+    Ok(())
+}
+
+fn copy_asset_file(source_path: &Path, out_path: &Path) -> Result<()> {
+    fs::copy(source_path, out_path).with_context(|| {
+        format!(
+            "Failed to copy {} -> {}",
+            source_path.display(),
+            out_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn process_regular(source_path: &Path, rel_path: &Path, out_dir: &Path) -> Result<()> {
+    let out_path = out_dir.join(rel_path);
+    mk_parent(&out_path)?;
+
+    match source_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+    {
+        "js" => output_min(source_path, &out_path, "JS", minify_js)?,
+        "css" => output_min(source_path, &out_path, "CSS", minify_css)?,
+        _ => copy_asset_file(source_path, &out_path)?,
+    }
+    Ok(())
+}
+
+fn process_html(
+    source_path: &Path,
+    rel_path: &Path,
+    out_dir: &Path,
+    include_dir: &Path,
+    engine: &TemplateEngine,
+) -> Result<()> {
+    let raw = fs::read_to_string(source_path)
+        .with_context(|| format!("Failed to read html: {}", source_path.display()))?;
+    let (frontmatter, body) = Frontmatter::try_parse(&raw)?;
+
+    let mut output_rel = default_output_path(rel_path);
+
+    let mut vars = frontmatter
+        .as_ref()
+        .map(|fm| fm.vars.clone())
+        .unwrap_or_default();
+    if let Some(path) = frontmatter.as_ref().and_then(|fm| fm.path.as_ref()) {
+        output_rel = normalize_web_path(path.as_str())?;
+        if output_rel.as_os_str().is_empty() {
+            bail!("frontmatter.path cannot be '/'");
+        }
+    }
+
+    let (text_to_render, content, current_dir) =
+        if let Some(tpl) = frontmatter.as_ref().and_then(|fm| fm.template.as_ref()) {
+            let template_path = include_dir.join(tpl);
+            let tpl_txt = fs::read_to_string(&template_path)
+                .with_context(|| format!("Failed to read template: {}", template_path.display()))?;
+            (tpl_txt, Some(body), include_dir)
+        } else {
+            (body, None, source_path.parent().unwrap())
+        };
+
+    let tokens = tokenize(&text_to_render)?;
+    let page_dir = source_path.parent().unwrap();
+    let content_tokens = content.map(|c| tokenize(&c).unwrap().into());
+    let rendered = engine.render(&tokens, &mut vars, current_dir, page_dir, content_tokens)?;
+
+    let out_path = out_dir.join(output_rel);
+    mk_parent(&out_path)?;
+
+    if fs::exists(&out_path)? {
+        bail!("Output file already exists: {}", out_path.display());
+    }
+
+    fs::write(&out_path, minify(rendered)?)
+        .with_context(|| format!("Failed to write {}", out_path.display()))?;
+    Ok(())
+}
+
 pub fn build_site(opts: BuildOptions) -> Result<std::time::Duration> {
     let start_time = std::time::Instant::now();
-    let in_dir = opts.in_dir;
-    let out_dir = opts.out_dir;
+    let BuildOptions { in_dir, out_dir, include_dir } = opts;
 
     if !in_dir.exists() {
         bail!("Input directory does not exist: {}", in_dir.display());
@@ -297,7 +405,7 @@ pub fn build_site(opts: BuildOptions) -> Result<std::time::Duration> {
     fs::create_dir_all(&out_dir)
         .with_context(|| format!("Failed to create out_dir {}", out_dir.display()))?;
 
-    let engine = TemplateEngine::new(opts.include_dir.clone());
+    let engine = TemplateEngine::new(include_dir.clone());
 
     for entry in WalkDir::new(&in_dir).follow_links(false) {
         let entry = entry?;
@@ -305,116 +413,16 @@ pub fn build_site(opts: BuildOptions) -> Result<std::time::Duration> {
 
         let rel = p.strip_prefix(&in_dir)?.to_path_buf();
 
-        // skip dotfiles
-        if rel.components().any(|c| match c {
-            std::path::Component::Normal(s) => s.to_str().is_some_and(|x| x.starts_with('.')),
-            _ => false,
-        }) {
-            continue;
-        }
-
-        if entry.file_type().is_dir() {
-            continue;
-        }
-
-        if rel.as_os_str().is_empty() {
-            continue;
-        }
-
-        if is_dot_file(p) {
+        if rel.as_os_str().is_empty() || entry.file_type().is_dir() || is_dot_file(p) {
             continue;
         }
 
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
 
         if ext == "html" {
-            let raw = fs::read_to_string(p)
-                .with_context(|| format!("Failed to read html: {}", p.display()))?;
-            let (frontmatter, body) = Frontmatter::try_parse(&raw)?;
-
-            let mut output_rel = default_output_path(&*rel);
-
-            let mut vars = frontmatter
-                .as_ref()
-                .map(|fm| fm.vars.clone())
-                .unwrap_or_default();
-            if let Some(path) = frontmatter.as_ref().and_then(|fm| fm.path.as_ref()) {
-                output_rel = normalize_web_path(path.as_str())?;
-                if output_rel.as_os_str().is_empty() {
-                    bail!("frontmatter.path cannot be '/'");
-                }
-            }
-
-            let (text_to_render, content, current_dir) =
-                if let Some(tpl) = frontmatter.as_ref().and_then(|fm| fm.template.as_ref()) {
-                    let template_path = opts.include_dir.join(tpl);
-                    let tpl_txt = fs::read_to_string(&template_path).with_context(|| {
-                        format!("Failed to read template: {}", template_path.display())
-                    })?;
-                    (tpl_txt, Some(body), opts.include_dir.as_path())
-                } else {
-                    (body, None, p.parent().unwrap())
-                };
-
-            let tokens = tokenize(&text_to_render)?;
-            let page_dir = p.parent().unwrap();
-            let content_tokens = content.map(|c| tokenize(&c).unwrap().into());
-            let rendered =
-                engine.render(&tokens, &mut vars, current_dir, page_dir, content_tokens)?;
-
-            let out_path = out_dir.join(output_rel);
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-
-            if fs::exists(&out_path)? {
-                bail!("Output file already exists: {}", out_path.display());
-            }
-
-            fs::write(&out_path, minify(rendered)?)
-                .with_context(|| format!("Failed to write {}", out_path.display()))?;
-        } else if ext == "js" {
-            let out_path = out_dir.join(rel);
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-
-            let js = fs::read_to_string(p)
-                .with_context(|| format!("Failed to read JS: {}", p.display()))?;
-            let minified = match minify_js(js.clone()) {
-                Ok(minified) => minified,
-                Err(err) => {
-                    eprintln!("Failed to minify JS file {}: {err}", p.display());
-                    js
-                }
-            };
-            fs::write(&out_path, minified)
-                .with_context(|| format!("Failed to write {}", out_path.display()))?;
-        } else if ext == "css" {
-            let out_path = out_dir.join(rel);
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-
-            let css = fs::read_to_string(p)
-                .with_context(|| format!("Failed to read CSS: {}", p.display()))?;
-            let minified = match minify_css(css.clone()) {
-                Ok(minified) => minified,
-                Err(err) => {
-                    eprintln!("Failed to minify CSS file {}: {err}", p.display());
-                    css
-                }
-            };
-            fs::write(&out_path, minified)
-                .with_context(|| format!("Failed to write {}", out_path.display()))?;
+            process_html(p, &rel, &out_dir, &include_dir, &engine)?;
         } else {
-            let out_path = out_dir.join(rel);
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(p, &out_path).with_context(|| {
-                format!("Failed to copy {} -> {}", p.display(), out_path.display())
-            })?;
+            process_regular(p, &rel, &out_dir)?;
         }
     }
 
