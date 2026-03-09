@@ -18,3 +18,4 @@ walkdir = "2"
 clap = { version = "4", features = ["derive"] }
 
 oxc = { version = "0.116", features = ["mangler", "minifier", "codegen"] }
+lightningcss = "1.0.0-alpha.71"

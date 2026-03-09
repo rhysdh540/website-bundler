@@ -4,6 +4,7 @@ pub mod templating;
 use crate::templating::{Frontmatter, TemplateEngine, tokenize};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
+use lightningcss::stylesheet::{MinifyOptions, ParserOptions, PrinterOptions, StyleSheet};
 use minify_html::{Cfg, minify as minify_html};
 use oxc::codegen::{Codegen as JsCodegen, CodegenOptions, CommentOptions};
 use oxc::minifier::{CompressOptions, MangleOptions, Minifier as JsMinifier, MinifierOptions};
@@ -236,7 +237,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 fn minify_js(js: String) -> Result<String> {
     let allocator = oxc::allocator::Allocator::default();
 
-    let parse = JsParser::new(&allocator, &js, SourceType::script()).parse();
+    let parse = JsParser::new(&allocator, &js, SourceType::unambiguous()).parse();
 
     if !parse.errors.is_empty() {
         bail!("Failed to parse JS: {}", parse.errors[0].to_string());
@@ -262,6 +263,22 @@ fn minify_js(js: String) -> Result<String> {
         .with_private_member_mappings(min_out.class_private_mappings)
         .build(&prog)
         .code)
+}
+
+fn minify_css(css: String) -> Result<String> {
+    let mut stylesheet = StyleSheet::parse(&css, ParserOptions::default())
+        .map_err(|e| anyhow!("Failed to parse CSS: {e}"))?;
+    stylesheet
+        .minify(MinifyOptions::default())
+        .map_err(|e| anyhow!("Failed to minify CSS: {e}"))?;
+
+    let mut printer_opts = PrinterOptions::default();
+    printer_opts.minify = true;
+
+    let out = stylesheet
+        .to_css(printer_opts)
+        .map_err(|e| anyhow!("Failed to print CSS: {e}"))?;
+    Ok(out.code)
 }
 
 pub fn build_site(opts: BuildOptions) -> Result<std::time::Duration> {
@@ -355,6 +372,40 @@ pub fn build_site(opts: BuildOptions) -> Result<std::time::Duration> {
             }
 
             fs::write(&out_path, minify(rendered)?)
+                .with_context(|| format!("Failed to write {}", out_path.display()))?;
+        } else if ext == "js" {
+            let out_path = out_dir.join(rel);
+            if let Some(parent) = out_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            let js = fs::read_to_string(p)
+                .with_context(|| format!("Failed to read JS: {}", p.display()))?;
+            let minified = match minify_js(js.clone()) {
+                Ok(minified) => minified,
+                Err(err) => {
+                    eprintln!("Failed to minify JS file {}: {err}", p.display());
+                    js
+                }
+            };
+            fs::write(&out_path, minified)
+                .with_context(|| format!("Failed to write {}", out_path.display()))?;
+        } else if ext == "css" {
+            let out_path = out_dir.join(rel);
+            if let Some(parent) = out_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            let css = fs::read_to_string(p)
+                .with_context(|| format!("Failed to read CSS: {}", p.display()))?;
+            let minified = match minify_css(css.clone()) {
+                Ok(minified) => minified,
+                Err(err) => {
+                    eprintln!("Failed to minify CSS file {}: {err}", p.display());
+                    css
+                }
+            };
+            fs::write(&out_path, minified)
                 .with_context(|| format!("Failed to write {}", out_path.display()))?;
         } else {
             let out_path = out_dir.join(rel);
