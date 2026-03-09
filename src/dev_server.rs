@@ -1,7 +1,7 @@
+use crate::{BuildOptions, build_site};
 use anyhow::{Context, Result};
 use axum::Router;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
-use crate::{build_site, BuildOptions};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -28,14 +28,20 @@ pub async fn run(opts: BuildOptions, addr: SocketAddr, debounce: u64) -> Result<
 
         tokio::spawn(rebuild_worker(rebuild_rx, opts.clone()));
 
-        let app = Router::new().fallback_service(ServeDir::new(&opts.out_dir)
-            .fallback(ServeFile::new(opts.out_dir.join("404.html"))));
+        let app = Router::new().fallback_service(
+            ServeDir::new(&opts.out_dir).fallback(ServeFile::new(opts.out_dir.join("404.html"))),
+        );
 
-        let listener = tokio::net::TcpListener::bind(addr).await
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
             .context("failed to bind dev server")?;
 
         println!("Serving {} at http://{}", opts.out_dir.display(), addr);
-        println!("Watching {} and {}", opts.in_dir.display(), opts.include_dir.display());
+        println!(
+            "Watching {} and {}",
+            opts.in_dir.display(),
+            opts.include_dir.display()
+        );
         println!("Output: {}", opts.out_dir.display());
         println!("Press Ctrl+C to stop");
 
@@ -70,8 +76,14 @@ async fn rebuild_worker(mut rx: mpsc::Receiver<()>, opts: BuildOptions) {
     }
 }
 
-pub fn watch(in_dir: PathBuf, rebuild_tx: mpsc::Sender<()>, debounce: Duration) -> Result<RecommendedWatcher> {
-    let last_sent = Arc::new(Mutex::new(Instant::now().checked_sub(Duration::from_secs(10)).unwrap()));
+pub fn watch(
+    in_dir: PathBuf,
+    rebuild_tx: mpsc::Sender<()>,
+    debounce: Duration,
+) -> Result<RecommendedWatcher> {
+    let last_sent = Arc::new(Mutex::new(
+        Instant::now().checked_sub(Duration::from_secs(10)).unwrap(),
+    ));
 
     let last_sent_cb = last_sent.clone();
 
@@ -79,15 +91,15 @@ pub fn watch(in_dir: PathBuf, rebuild_tx: mpsc::Sender<()>, debounce: Duration) 
         move |res: std::result::Result<notify::Event, notify::Error>| match res {
             Ok(ev) => {
                 let is_junk = ev.paths.iter().any(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n == ".DS_Store" || n.starts_with("._") || n.starts_with('.'))
+                    p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                        n == ".DS_Store" || n.starts_with("._") || n.starts_with('.')
+                    })
                 });
                 if is_junk {
                     return;
                 }
 
-                use notify::event::{ModifyKind, EventKind};
+                use notify::event::{EventKind, ModifyKind};
                 let meaningful = matches!(
                     ev.kind,
                     EventKind::Create(_)
@@ -110,7 +122,6 @@ pub fn watch(in_dir: PathBuf, rebuild_tx: mpsc::Sender<()>, debounce: Duration) 
                 eprintln!("watch error: {e}");
             }
         },
-
         Config::default(),
     )?;
 

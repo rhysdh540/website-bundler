@@ -1,17 +1,17 @@
-pub mod templating;
 pub mod dev_server;
+pub mod templating;
 
-use anyhow::{anyhow, bail, Context, Result};
-use minify_html::{minify as minify_html, Cfg};
-use std::fs;
-use std::path::{Path, PathBuf};
+use crate::templating::{Frontmatter, TemplateEngine, tokenize};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
+use minify_html::{Cfg, minify as minify_html};
 use oxc::codegen::{Codegen as JsCodegen, CodegenOptions, CommentOptions};
 use oxc::minifier::{CompressOptions, MangleOptions, Minifier as JsMinifier, MinifierOptions};
 use oxc::parser::Parser as JsParser;
 use oxc::span::SourceType;
+use std::fs;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
-use crate::templating::{Frontmatter, TemplateEngine, tokenize};
 
 #[derive(Debug, Clone, Parser, Default)]
 #[command(author, version, about)]
@@ -236,11 +236,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 fn minify_js(js: String) -> Result<String> {
     let allocator = oxc::allocator::Allocator::default();
 
-    let parse = JsParser::new(
-        &allocator,
-        &js,
-        SourceType::script()
-    ).parse();
+    let parse = JsParser::new(&allocator, &js, SourceType::script()).parse();
 
     if !parse.errors.is_empty() {
         bail!("Failed to parse JS: {}", parse.errors[0].to_string());
@@ -253,7 +249,8 @@ fn minify_js(js: String) -> Result<String> {
             ..Default::default()
         }),
         compress: Some(CompressOptions::smallest()),
-    }).minify(&allocator, &mut prog);
+    })
+    .minify(&allocator, &mut prog);
 
     Ok(JsCodegen::new()
         .with_options(CodegenOptions {
@@ -277,13 +274,11 @@ pub fn build_site(opts: BuildOptions) -> Result<std::time::Duration> {
     }
 
     if out_dir.exists() {
-        fs::remove_dir_all(&out_dir).with_context(|| {
-            format!("Failed to remove out_dir {}", out_dir.display())
-        })?;
+        fs::remove_dir_all(&out_dir)
+            .with_context(|| format!("Failed to remove out_dir {}", out_dir.display()))?;
     }
-    fs::create_dir_all(&out_dir).with_context(|| {
-        format!("Failed to create out_dir {}", out_dir.display())
-    })?;
+    fs::create_dir_all(&out_dir)
+        .with_context(|| format!("Failed to create out_dir {}", out_dir.display()))?;
 
     let engine = TemplateEngine::new(opts.include_dir.clone());
 
@@ -316,14 +311,16 @@ pub fn build_site(opts: BuildOptions) -> Result<std::time::Duration> {
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
 
         if ext == "html" {
-            let raw = fs::read_to_string(p).with_context(|| {
-                format!("Failed to read html: {}", p.display())
-            })?;
+            let raw = fs::read_to_string(p)
+                .with_context(|| format!("Failed to read html: {}", p.display()))?;
             let (frontmatter, body) = Frontmatter::try_parse(&raw)?;
 
             let mut output_rel = default_output_path(&*rel);
 
-            let mut vars = frontmatter.as_ref().map(|fm| fm.vars.clone()).unwrap_or_default();
+            let mut vars = frontmatter
+                .as_ref()
+                .map(|fm| fm.vars.clone())
+                .unwrap_or_default();
             if let Some(path) = frontmatter.as_ref().and_then(|fm| fm.path.as_ref()) {
                 output_rel = normalize_web_path(path.as_str())?;
                 if output_rel.as_os_str().is_empty() {
@@ -331,20 +328,22 @@ pub fn build_site(opts: BuildOptions) -> Result<std::time::Duration> {
                 }
             }
 
-            let (text_to_render, content, current_dir) = if let Some(tpl) = frontmatter.as_ref().and_then(|fm| fm.template.as_ref()) {
-                let template_path = opts.include_dir.join(tpl);
-                let tpl_txt = fs::read_to_string(&template_path).with_context(|| {
-                    format!("Failed to read template: {}", template_path.display())
-                })?;
-                (tpl_txt, Some(body), opts.include_dir.as_path())
-            } else {
-                (body, None, p.parent().unwrap())
-            };
+            let (text_to_render, content, current_dir) =
+                if let Some(tpl) = frontmatter.as_ref().and_then(|fm| fm.template.as_ref()) {
+                    let template_path = opts.include_dir.join(tpl);
+                    let tpl_txt = fs::read_to_string(&template_path).with_context(|| {
+                        format!("Failed to read template: {}", template_path.display())
+                    })?;
+                    (tpl_txt, Some(body), opts.include_dir.as_path())
+                } else {
+                    (body, None, p.parent().unwrap())
+                };
 
             let tokens = tokenize(&text_to_render)?;
             let page_dir = p.parent().unwrap();
             let content_tokens = content.map(|c| tokenize(&c).unwrap().into());
-            let rendered = engine.render(&tokens, &mut vars, current_dir, page_dir, content_tokens)?;
+            let rendered =
+                engine.render(&tokens, &mut vars, current_dir, page_dir, content_tokens)?;
 
             let out_path = out_dir.join(output_rel);
             if let Some(parent) = out_path.parent() {
@@ -355,9 +354,8 @@ pub fn build_site(opts: BuildOptions) -> Result<std::time::Duration> {
                 bail!("Output file already exists: {}", out_path.display());
             }
 
-            fs::write(&out_path, minify(rendered)?).with_context(|| {
-                format!("Failed to write {}", out_path.display())
-            })?;
+            fs::write(&out_path, minify(rendered)?)
+                .with_context(|| format!("Failed to write {}", out_path.display()))?;
         } else {
             let out_path = out_dir.join(rel);
             if let Some(parent) = out_path.parent() {

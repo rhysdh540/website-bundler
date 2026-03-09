@@ -1,6 +1,6 @@
-use std::net::SocketAddr;
-use clap::Parser;
 use anyhow::Result;
+use clap::Parser;
+use std::net::SocketAddr;
 
 #[derive(Debug, Clone, Parser)]
 #[command(author, version, about)]
@@ -17,7 +17,7 @@ enum Cli {
         /// Time to wait after rebuilding before trying to rebuild again.
         #[arg(long, default_value = "300")]
         debounce: u64,
-    }
+    },
 }
 
 #[tokio::main]
@@ -28,8 +28,10 @@ async fn main() -> Result<()> {
             println!("Built in {:?}", website_bundler::build_site(opts)?);
             Ok(())
         }
-        Cli::Dev { build, addr, debounce } => {
-            website_bundler::dev_server::run(build, addr, debounce).await
-        }
+        Cli::Dev {
+            build,
+            addr,
+            debounce,
+        } => website_bundler::dev_server::run(build, addr, debounce).await,
     }
 }
