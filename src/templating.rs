@@ -522,9 +522,8 @@ impl TemplateEngine {
     ) -> Result<()> {
         let var_name =
             get_param(params, "var").ok_or_else(|| anyhow!("echo missing 'var' parameter"))?;
-        if let Some(val) = vars.get(var_name) {
-            output.push_str(val);
-        }
+        let val = get_var(var_name, vars).unwrap_or_default();
+        output.push_str(&val);
         Ok(())
     }
 
