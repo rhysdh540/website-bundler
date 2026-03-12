@@ -235,6 +235,9 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 fn minify_js(js: String) -> Result<String> {
+    if js.contains("//! NO-MINIFY") {
+        return Ok(js);
+    }
     let allocator = oxc::allocator::Allocator::default();
 
     let parse = JsParser::new(&allocator, &js, SourceType::unambiguous()).parse();
@@ -245,10 +248,14 @@ fn minify_js(js: String) -> Result<String> {
 
     let mut prog = parse.program;
     let min_out = JsMinifier::new(MinifierOptions {
-        mangle: Some(MangleOptions {
-            top_level: Some(true),
-            ..Default::default()
-        }),
+        mangle: if js.contains("//! NO-MANGLE") {
+            None
+        } else {
+            Some(MangleOptions {
+                top_level: Some(true),
+                ..Default::default()
+            })
+        },
         compress: Some(CompressOptions::smallest()),
     })
     .minify(&allocator, &mut prog);
