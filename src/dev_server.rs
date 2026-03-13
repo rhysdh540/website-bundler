@@ -32,9 +32,15 @@ pub async fn run(opts: BuildOptions, addr: SocketAddr, debounce: u64) -> Result<
 
         tokio::spawn(rebuild_worker(rebuild_rx, opts.clone()));
 
-        let app = Router::new().fallback_service(
-            ServeDir::new(&opts.out_dir).fallback(ServeFile::new(opts.out_dir.join("404.html"))),
-        );
+        let app = Router::new()
+            .route(
+                "/robots.txt",
+                axum::routing::get(|| async { "User-agent: *\nDisallow: /" }),
+            )
+            .fallback_service(
+                ServeDir::new(&opts.out_dir)
+                    .fallback(ServeFile::new(opts.out_dir.join("404.html"))),
+            );
 
         let listener = tokio::net::TcpListener::bind(addr)
             .await
