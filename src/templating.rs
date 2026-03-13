@@ -398,6 +398,16 @@ fn evaluate_expr(expr: &str, vars: &HashMap<String, String>) -> Result<bool> {
         return Ok(get_var(left, vars).is_some_and(|actual| actual == expected));
     }
 
+    if let Some(idx) = find_operator(expr, "!=") {
+        let left = expr[..idx].trim();
+        let right = expr[idx + 2..].trim();
+        if left.is_empty() || right.is_empty() {
+            bail!("Invalid comparison expression: '{expr}'");
+        }
+        let expected = parse_str_sq(right)?;
+        return Ok(get_var(left, vars).is_some_and(|actual| actual != expected));
+    }
+
     if expr == "true" {
         return Ok(true);
     }
