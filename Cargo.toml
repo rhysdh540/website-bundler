@@ -17,5 +17,10 @@ notify = "8"
 walkdir = "2"
 clap = { version = "4", features = ["derive"] }
 
-oxc = { version = "0.116", features = ["mangler", "minifier", "codegen"] }
+blake3 = "1.8.3"
+base64 = "0.22"
+mime_guess = "2.0"
+reqwest = { version = "0.13", features = ["multipart"] }
+
+oxc = { version = "0.119", features = ["mangler", "minifier", "codegen"] }
 lightningcss = "1.0.0-alpha.71"

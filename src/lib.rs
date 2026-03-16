@@ -1,5 +1,6 @@
 pub mod dev_server;
 pub mod templating;
+pub mod deploy;
 
 use crate::templating::{Frontmatter, TemplateEngine, tokenize};
 use anyhow::{Context, Result, anyhow, bail};
