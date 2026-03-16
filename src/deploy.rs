@@ -1,11 +1,11 @@
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
-use anyhow::{anyhow, bail, Result};
 use ::base64::Engine;
+use anyhow::{Result, anyhow, bail};
 use axum::http;
 use base64::engine::general_purpose as base64;
 use serde_json::Value as Json;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 static API_URL_BASE: LazyLock<String> = LazyLock::new(|| {
     std::env::var("CF_API_URL_BASE")
@@ -13,6 +13,8 @@ static API_URL_BASE: LazyLock<String> = LazyLock::new(|| {
 });
 
 const USER_AGENT: &str = "wrangler/4.73.0"; // totally!
+const MAX_BUCKET_FILE_COUNT: usize = 2000;
+const MAX_BUCKET_SIZE_BYTES: u64 = 40 * 1024 * 1024;
 
 struct Asset {
     path: PathBuf,
@@ -28,7 +30,10 @@ pub async fn deploy(
     api_token: &str,
 ) -> Result<()> {
     if !directory.is_dir() {
-        return Err(anyhow!(format!("path {} is not a directory", directory.display())));
+        return Err(anyhow!(format!(
+            "path {} is not a directory",
+            directory.display()
+        )));
     }
 
     let start_time = std::time::Instant::now();
@@ -36,54 +41,69 @@ pub async fn deploy(
     let jwt = get_jwt(account_id, project_name, api_token).await?;
     println!("acquired upload token ({:?})", timer.elapsed());
 
-    let max_file_count = jwt.1.get("max_file_count_allowed")
-        .and_then(|v| v.as_u64()).map(|v| v as usize);
+    let max_file_count = jwt
+        .1
+        .get("max_file_count_allowed")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
 
     timer = std::time::Instant::now();
     let files = gather(&directory, max_file_count)?;
     println!("found {} files ({:?})", files.len(), timer.elapsed());
 
     timer = std::time::Instant::now();
-    let missing_count = upload_missing(&files, &jwt.0).await?;
-    println!("uploaded {} missing files ({:?})", missing_count, timer.elapsed());
+    let force_upload = std::env::var("CF_FORCE_UPLOAD")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+    let missing_count = upload_missing(&files, &jwt.0, force_upload).await?;
+    println!(
+        "uploaded {} missing files ({:?})",
+        missing_count,
+        timer.elapsed()
+    );
 
-    let hashes = files.iter().map(|a| a.hash.clone()).collect::<Vec<_>>();
-    if let Err(e) = upsert_hashes(&hashes, &jwt.0).await {
-        eprintln!("warning: upsert-hashes failed: {}", e);
-    }
+    let deployment = create_deployment(&files, account_id, project_name, api_token).await?;
 
-    let deployment = create_deployment(
-        &files,
-        account_id,
-        project_name,
-        api_token,
-    ).await?;
-
-    let deployment_id = deployment.get("id").and_then(|v| v.as_str())
+    let deployment_id = deployment
+        .get("id")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("deployment response missing id"))?;
-    let deployment_url = deployment.get("url").and_then(|v| v.as_str()).unwrap_or("(unknown)");
-    println!("deployment {} created: {} (total {:?})", deployment_id, deployment_url, start_time.elapsed());
+    let deployment_url = deployment
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(unknown)");
+    println!(
+        "deployment {} created: {} (total {:?})",
+        deployment_id,
+        deployment_url,
+        start_time.elapsed()
+    );
 
     Ok(())
 }
 
-async fn get_jwt(
-    account_id: &str,
-    project_name: &str,
-    api_token: &str,
-) -> Result<(String, Json)> {
+async fn get_jwt(account_id: &str, project_name: &str, api_token: &str) -> Result<(String, Json)> {
     let jwt = make_request(
         http::Method::GET,
-        &format!("accounts/{}/pages/projects/{}/upload-token", account_id, project_name),
+        &format!(
+            "accounts/{}/pages/projects/{}/upload-token",
+            account_id, project_name
+        ),
         api_token,
         None,
         None,
-    ).await?
-        .ok_or_else(|| anyhow!("no result returned from upload-token"))?
-        .get("jwt").and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("cf api response doesn't have jwt"))?.to_string();
+    )
+    .await?
+    .ok_or_else(|| anyhow!("no result returned from upload-token"))?
+    .get("jwt")
+    .and_then(|v| v.as_str())
+    .ok_or_else(|| anyhow!("cf api response doesn't have jwt"))?
+    .to_string();
 
-    let payload = jwt.split('.').nth(1).ok_or_else(|| anyhow!("invalid jwt"))?;
+    let payload = jwt
+        .split('.')
+        .nth(1)
+        .ok_or_else(|| anyhow!("invalid jwt"))?;
     let decoded = base64::URL_SAFE_NO_PAD.decode(payload)?;
     Ok((jwt, serde_json::from_slice(&decoded)?))
 }
@@ -100,40 +120,94 @@ fn gather(directory: &PathBuf, max_file_count: Option<usize>) -> Result<Vec<Asse
 
         assets.push(Asset {
             path: path.clone(),
-            name: path.strip_prefix(directory)?.to_str().ok_or_else(|| anyhow!("invalid path"))?.replace("\\", "/"),
-            ctype: mime_guess::from_path(&path).first_or_octet_stream().to_string(),
+            name: path
+                .strip_prefix(directory)?
+                .to_str()
+                .ok_or_else(|| anyhow!("invalid path"))?
+                .replace("\\", "/"),
+            ctype: mime_guess::from_path(&path)
+                .first_or_octet_stream()
+                .to_string(),
             hash: hash(&path)?,
         });
     }
 
-    if let Some(max) = max_file_count && assets.len() > max {
-        return Err(anyhow!(format!("too many files: {} (max {})", assets.len(), max)));
+    if let Some(max) = max_file_count
+        && assets.len() > max
+    {
+        return Err(anyhow!(format!(
+            "too many files: {} (max {})",
+            assets.len(),
+            max
+        )));
     }
 
     Ok(assets)
 }
 
-async fn upload_missing(assets: &[Asset], jwt: &str) -> Result<usize> {
-    let hashes = assets.iter().map(|a| a.hash.clone()).collect::<Vec<_>>();
-    let response = make_request(
-        http::Method::POST,
-        "pages/assets/check-missing",
-        jwt,
-        Some(serde_json::json!({ "hashes": hashes }).to_string()),
-        Some(vec![(http::header::CONTENT_TYPE, "application/json")]),
-    ).await?.ok_or_else(|| anyhow!("no result returned from check-missing"))?;
+async fn upload_missing(assets: &[Asset], jwt: &str, force_upload: bool) -> Result<usize> {
+    let to_upload: Vec<&Asset> = if force_upload {
+        assets.iter().collect()
+    } else {
+        let hashes = assets.iter().map(|a| a.hash.clone()).collect::<Vec<_>>();
+        let response = make_request(
+            http::Method::POST,
+            "pages/assets/check-missing",
+            jwt,
+            Some(serde_json::json!({ "hashes": hashes }).to_string()),
+            Some(vec![(http::header::CONTENT_TYPE, "application/json")]),
+        )
+        .await?
+        .ok_or_else(|| anyhow!("no result returned from check-missing"))?;
 
-    let missing: HashSet<String> = response.as_array().ok_or_else(|| anyhow!("response from check-missing not array"))?
-        .iter()
-        .map(|v| v.as_str().ok_or_else(|| anyhow!("non-string hash in check-missing response")).map(|s| s.to_string()))
-        .collect::<Result<_>>()?;
+        let missing: HashSet<String> = response
+            .as_array()
+            .ok_or_else(|| anyhow!("response from check-missing not array"))?
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .ok_or_else(|| anyhow!("non-string hash in check-missing response"))
+                    .map(|s| s.to_string())
+            })
+            .collect::<Result<_>>()?;
 
-    let mut payload: Vec<Json> = Vec::new();
-    let mut n = 0;
-    for asset in assets {
-        if !missing.contains(&asset.hash) {
-            continue;
+        assets
+            .iter()
+            .filter(|a| missing.contains(&a.hash))
+            .collect()
+    };
+
+    if to_upload.is_empty() {
+        return Ok(0);
+    }
+
+    let mut uploaded = 0usize;
+    let mut batch = Vec::<&Asset>::new();
+    let mut batch_size = 0u64;
+    for asset in to_upload {
+        let size = std::fs::metadata(&asset.path)?.len();
+        if !batch.is_empty()
+            && (batch.len() >= MAX_BUCKET_FILE_COUNT || batch_size + size > MAX_BUCKET_SIZE_BYTES)
+        {
+            upload_batch(&batch, jwt).await?;
+            uploaded += batch.len();
+            batch.clear();
+            batch_size = 0;
         }
+        batch.push(asset);
+        batch_size += size;
+    }
+    if !batch.is_empty() {
+        upload_batch(&batch, jwt).await?;
+        uploaded += batch.len();
+    }
+
+    Ok(uploaded)
+}
+
+async fn upload_batch(batch: &[&Asset], jwt: &str) -> Result<()> {
+    let mut payload: Vec<Json> = Vec::with_capacity(batch.len());
+    for asset in batch {
         payload.push(serde_json::json!({
             "key": asset.hash,
             "value": base64::STANDARD.encode(std::fs::read(&asset.path)?),
@@ -142,7 +216,6 @@ async fn upload_missing(assets: &[Asset], jwt: &str) -> Result<usize> {
             },
             "base64": true,
         }));
-        n += 1;
     }
 
     make_request(
@@ -151,18 +224,16 @@ async fn upload_missing(assets: &[Asset], jwt: &str) -> Result<usize> {
         jwt,
         Some(serde_json::to_string(&payload)?),
         Some(vec![(http::header::CONTENT_TYPE, "application/json")]),
-    ).await?;
-
-    Ok(n)
+    )
+    .await?;
+    Ok(())
 }
 
 fn should_ignore(path: &Path, root: &PathBuf) -> bool {
     if path == root {
         return false;
     }
-    let file_name = path.file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
+    let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
     if path.parent().is_some_and(|p| p == root) {
         // at the root level: ignore _* files (except _headers and _redirects which are uploaded separately)
         if file_name.starts_with('_') && file_name != "_headers" && file_name != "_redirects" {
@@ -183,40 +254,36 @@ fn hash(path: &PathBuf) -> Result<String> {
     Ok(hash.to_hex()[..32].to_string())
 }
 
-async fn upsert_hashes(hashes: &[String], jwt: &str) -> Result<()> {
-    make_request(
-        http::Method::POST,
-        "pages/assets/upsert-hashes",
-        jwt,
-        Some(serde_json::json!({ "hashes": hashes }).to_string()),
-        Some(vec![(http::header::CONTENT_TYPE, "application/json")]),
-    ).await?;
-    Ok(())
-}
-
 async fn create_deployment(
     assets: &[Asset],
     account_id: &str,
     project_name: &str,
     api_token: &str,
 ) -> Result<Json> {
-    let manifest: HashMap<String, String> = assets.iter()
+    let manifest: HashMap<String, String> = assets
+        .iter()
         .map(|a| (format!("/{}", a.name), a.hash.clone()))
         .collect();
     let manifest_json = serde_json::to_string(&manifest)?;
 
     let client = reqwest::Client::new();
-    let url = format!("{}/accounts/{}/pages/projects/{}/deployments", *API_URL_BASE, account_id, project_name);
-    let response = client.post(url)
+    let url = format!(
+        "{}/accounts/{}/pages/projects/{}/deployments",
+        *API_URL_BASE, account_id, project_name
+    );
+    let response = client
+        .post(url)
         .header(http::header::AUTHORIZATION, format!("Bearer {}", api_token))
         .header(http::header::USER_AGENT, USER_AGENT)
-        .multipart(reqwest::multipart::Form::new()
-            .text("manifest", manifest_json))
-        .send().await?;
+        .multipart(reqwest::multipart::Form::new().text("manifest", manifest_json))
+        .send()
+        .await?;
 
     let json = serde_json::from_slice::<Json>(response.bytes().await?.as_ref())?;
     if json.get("success").and_then(|v| v.as_bool()) != Some(true) {
-        let errors = json.get("errors").and_then(|v| v.as_array())
+        let errors = json
+            .get("errors")
+            .and_then(|v| v.as_array())
             .ok_or_else(|| anyhow!("no success and no errors"))?;
         let mut msg = "create deployment failed:".to_string();
         for error in errors {
@@ -232,7 +299,10 @@ async fn create_deployment(
         bail!(msg);
     }
 
-    Ok(json.get("result").ok_or_else(|| anyhow!("no result"))?.clone())
+    Ok(json
+        .get("result")
+        .ok_or_else(|| anyhow!("no result"))?
+        .clone())
 }
 
 async fn make_request(
@@ -244,7 +314,8 @@ async fn make_request(
 ) -> Result<Option<Json>> {
     let client = reqwest::Client::new();
     let url = format!("{}/{}", *API_URL_BASE, path);
-    let mut request = client.request(method, url)
+    let mut request = client
+        .request(method, url)
         .header(http::header::AUTHORIZATION, format!("Bearer {}", token))
         .header(http::header::USER_AGENT, USER_AGENT); // totally!
     if let Some(headers) = headers {
@@ -260,7 +331,10 @@ async fn make_request(
     let json = serde_json::from_slice::<Json>(response.bytes().await?.as_ref())?;
 
     if json.get("success").and_then(|v| v.as_bool()) != Some(true) {
-        let errors = json.get("errors").and_then(|v| v.as_array()).ok_or_else(|| anyhow!("no success and no errors"))?;
+        let errors = json
+            .get("errors")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow!("no success and no errors"))?;
         let mut msg = format!("request to {} failed:", path);
         for error in errors {
             msg.push_str("\n- ");
