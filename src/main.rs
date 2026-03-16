@@ -25,8 +25,8 @@ enum Cli {
 
         /// Cloudflare Pages project name to deploy to.
         #[arg(long)]
-        project_name: String
-    }
+        project_name: String,
+    },
 }
 
 #[tokio::main]
@@ -42,15 +42,13 @@ async fn main() -> Result<()> {
             addr,
             debounce,
         } => website_bundler::dev_server::run(build, addr, debounce).await,
-        Cli::Deploy {
-            dir,
-            project_name,
-        } => {
-            let account_id = std::env::var("CF_ACCOUNT_ID")
-                .expect("CF_ACCOUNT_ID environment variable not set");
-            let api_token = std::env::var("CF_API_TOKEN")
-                .expect("CF_API_TOKEN environment variable not set");
-            website_bundler::deploy::deploy(dir.into(), &project_name, &account_id, &api_token).await
+        Cli::Deploy { dir, project_name } => {
+            let account_id =
+                std::env::var("CF_ACCOUNT_ID").expect("CF_ACCOUNT_ID environment variable not set");
+            let api_token =
+                std::env::var("CF_API_TOKEN").expect("CF_API_TOKEN environment variable not set");
+            website_bundler::deploy::deploy(dir.into(), &project_name, &account_id, &api_token)
+                .await
         }
     }
 }

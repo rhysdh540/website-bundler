@@ -1,6 +1,6 @@
+pub mod deploy;
 pub mod dev_server;
 pub mod templating;
-pub mod deploy;
 
 use crate::templating::{Frontmatter, TemplateEngine, tokenize};
 use anyhow::{Context, Result, anyhow, bail};
@@ -400,7 +400,11 @@ fn process_html(
 
 pub fn build_site(opts: BuildOptions) -> Result<std::time::Duration> {
     let start_time = std::time::Instant::now();
-    let BuildOptions { in_dir, out_dir, include_dir } = opts;
+    let BuildOptions {
+        in_dir,
+        out_dir,
+        include_dir,
+    } = opts;
 
     if !in_dir.exists() {
         bail!("Input directory does not exist: {}", in_dir.display());

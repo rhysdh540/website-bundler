@@ -30,10 +30,7 @@ pub async fn deploy(
     api_token: &str,
 ) -> Result<()> {
     if !directory.is_dir() {
-        return Err(anyhow!(format!(
-            "path {} is not a directory",
-            directory.display()
-        )));
+        bail!("path {} is not a directory", directory.display());
     }
 
     let start_time = std::time::Instant::now();
@@ -135,11 +132,7 @@ fn gather(directory: &PathBuf, max_file_count: Option<usize>) -> Result<Vec<Asse
     if let Some(max) = max_file_count
         && assets.len() > max
     {
-        return Err(anyhow!(format!(
-            "too many files: {} (max {})",
-            assets.len(),
-            max
-        )));
+        bail!("too many files: {} (max {})", assets.len(), max);
     }
 
     Ok(assets)
