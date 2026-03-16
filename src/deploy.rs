@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use anyhow::{anyhow, bail, Result};
@@ -23,9 +23,9 @@ struct Asset {
 
 pub async fn deploy(
     directory: PathBuf,
-    project_name: &String,
-    account_id: &String,
-    api_token: &String,
+    project_name: &str,
+    account_id: &str,
+    api_token: &str,
 ) -> Result<()> {
     if !directory.is_dir() {
         return Err(anyhow!(format!("path {} is not a directory", directory.display())));
@@ -68,9 +68,9 @@ pub async fn deploy(
 }
 
 async fn get_jwt(
-    account_id: &String,
-    project_name: &String,
-    api_token: &String,
+    account_id: &str,
+    project_name: &str,
+    api_token: &str,
 ) -> Result<(String, Json)> {
     let jwt = make_request(
         http::Method::GET,
@@ -84,7 +84,7 @@ async fn get_jwt(
         .ok_or_else(|| anyhow!("cf api response doesn't have jwt"))?.to_string();
 
     let payload = jwt.split('.').nth(1).ok_or_else(|| anyhow!("invalid jwt"))?;
-    let decoded = base64::STANDARD_NO_PAD.decode(payload)?;
+    let decoded = base64::URL_SAFE_NO_PAD.decode(payload)?;
     Ok((jwt, serde_json::from_slice(&decoded)?))
 }
 
@@ -113,7 +113,7 @@ fn gather(directory: &PathBuf, max_file_count: Option<usize>) -> Result<Vec<Asse
     Ok(assets)
 }
 
-async fn upload_missing(assets: &Vec<Asset>, jwt: &String) -> Result<usize> {
+async fn upload_missing(assets: &[Asset], jwt: &str) -> Result<usize> {
     let hashes = assets.iter().map(|a| a.hash.clone()).collect::<Vec<_>>();
     let response = make_request(
         http::Method::POST,
@@ -123,8 +123,10 @@ async fn upload_missing(assets: &Vec<Asset>, jwt: &String) -> Result<usize> {
         Some(vec![(http::header::CONTENT_TYPE, "application/json")]),
     ).await?.ok_or_else(|| anyhow!("no result returned from check-missing"))?;
 
-    let missing = response.as_array().ok_or_else(|| anyhow!("response from check-missing not array"))?
-        .iter().map(ToString::to_string).collect::<Vec<_>>();
+    let missing: HashSet<String> = response.as_array().ok_or_else(|| anyhow!("response from check-missing not array"))?
+        .iter()
+        .map(|v| v.as_str().ok_or_else(|| anyhow!("non-string hash in check-missing response")).map(|s| s.to_string()))
+        .collect::<Result<_>>()?;
 
     let mut payload: Vec<Json> = Vec::new();
     let mut n = 0;
@@ -181,7 +183,7 @@ fn hash(path: &PathBuf) -> Result<String> {
     Ok(hash.to_hex()[..32].to_string())
 }
 
-async fn upsert_hashes(hashes: &Vec<String>, jwt: &String) -> Result<()> {
+async fn upsert_hashes(hashes: &[String], jwt: &str) -> Result<()> {
     make_request(
         http::Method::POST,
         "pages/assets/upsert-hashes",
@@ -193,10 +195,10 @@ async fn upsert_hashes(hashes: &Vec<String>, jwt: &String) -> Result<()> {
 }
 
 async fn create_deployment(
-    assets: &Vec<Asset>,
-    account_id: &String,
-    project_name: &String,
-    api_token: &String,
+    assets: &[Asset],
+    account_id: &str,
+    project_name: &str,
+    api_token: &str,
 ) -> Result<Json> {
     let manifest: HashMap<String, String> = assets.iter()
         .map(|a| (format!("/{}", a.name), a.hash.clone()))
@@ -236,7 +238,7 @@ async fn create_deployment(
 async fn make_request(
     method: http::Method,
     path: &str,
-    token: &String,
+    token: &str,
     body: Option<String>,
     headers: Option<Vec<(http::header::HeaderName, &str)>>,
 ) -> Result<Option<Json>> {
