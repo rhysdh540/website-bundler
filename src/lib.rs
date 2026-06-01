@@ -26,40 +26,75 @@ pub struct BuildOptions {
     pub include_dir: PathBuf,
 }
 
-fn is_dot_file(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|s| s.to_str())
-        .is_some_and(|s| s.starts_with('.'))
-}
+mod paths {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use anyhow::bail;
 
-fn normalize_web_path(s: &str) -> Result<PathBuf> {
-    if !s.starts_with('/') {
-        bail!("frontmatter.path must start with '/': got {s}");
-    }
-    let trimmed = s.trim_start_matches('/');
-    Ok(PathBuf::from(trimmed))
-}
-
-fn default_output_path(rel_source_path: &Path) -> PathBuf {
-    let file_name = rel_source_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default();
-
-    if file_name.eq_ignore_ascii_case("index.html") {
-        return rel_source_path.to_path_buf();
-    }
-
-    if rel_source_path.extension().and_then(|e| e.to_str()) == Some("html") {
-        let stem = rel_source_path
-            .file_stem()
+    pub fn is_dot(path: &Path) -> bool {
+        path.file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or("page");
-        let parent = rel_source_path.parent().unwrap_or(Path::new(""));
-        return parent.join(stem).join("index.html");
+            .is_some_and(|s| s.starts_with('.'))
     }
 
-    rel_source_path.to_path_buf()
+    pub fn normalize(s: &str) -> anyhow::Result<PathBuf> {
+        if !s.starts_with('/') {
+            bail!("frontmatter.path must start with '/': got {s}");
+        }
+        let trimmed = s.trim_start_matches('/');
+        Ok(PathBuf::from(trimmed))
+    }
+
+    pub fn default_output(source_rel: &Path) -> PathBuf {
+        let file_name = source_rel
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+
+        if file_name.eq_ignore_ascii_case("index.html") {
+            return source_rel.to_path_buf();
+        }
+
+        if source_rel.extension().and_then(|e| e.to_str()) == Some("html") {
+            let stem = source_rel
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("page");
+            let parent = source_rel.parent().unwrap_or(Path::new(""));
+            return parent.join(stem).join("index.html");
+        }
+
+        source_rel.to_path_buf()
+    }
+
+    pub fn get_output(output_rel: &Path) -> String {
+        let output_rel_str = output_rel.to_string_lossy().replace('\\', "/");
+
+        if output_rel_str == "index.html" {
+            return "/".to_string();
+        }
+
+        if output_rel
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("index.html"))
+        {
+            let parent = output_rel
+                .parent()
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            return format!("/{parent}/");
+        }
+
+        format!("/{output_rel_str}")
+    }
+
+    pub fn mk_parent(out: &Path) -> anyhow::Result<()> {
+        if let Some(parent) = out.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        Ok(())
+    }
 }
 
 fn minify(html: String) -> Result<Vec<u8>> {
@@ -289,13 +324,6 @@ fn minify_css(css: String) -> Result<String> {
     Ok(out.code)
 }
 
-fn mk_parent(out_path: &Path) -> Result<()> {
-    if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    Ok(())
-}
-
 fn output_min(
     source_path: &Path,
     out_path: &Path,
@@ -333,7 +361,7 @@ fn copy_asset_file(source_path: &Path, out_path: &Path) -> Result<()> {
 
 fn process_regular(source_path: &Path, rel_path: &Path, out_dir: &Path) -> Result<()> {
     let out_path = out_dir.join(rel_path);
-    mk_parent(&out_path)?;
+    paths::mk_parent(&out_path)?;
 
     match source_path
         .extension()
@@ -358,18 +386,19 @@ fn process_html(
         .with_context(|| format!("Failed to read html: {}", source_path.display()))?;
     let (frontmatter, body) = Frontmatter::try_parse(&raw)?;
 
-    let mut output_rel = default_output_path(rel_path);
+    let mut output_rel = paths::default_output(rel_path);
 
     let mut vars = frontmatter
         .as_ref()
         .map(|fm| fm.vars.clone())
         .unwrap_or_default();
     if let Some(path) = frontmatter.as_ref().and_then(|fm| fm.path.as_ref()) {
-        output_rel = normalize_web_path(path.as_str())?;
+        output_rel = paths::normalize(path.as_str())?;
         if output_rel.as_os_str().is_empty() {
             bail!("frontmatter.path cannot be '/'");
         }
     }
+    vars.insert("page.path".to_string(), paths::get_output(&output_rel));
 
     let (text_to_render, content, current_dir) =
         if let Some(tpl) = frontmatter.as_ref().and_then(|fm| fm.template.as_ref()) {
@@ -387,7 +416,7 @@ fn process_html(
     let rendered = engine.render(&tokens, &mut vars, current_dir, page_dir, content_tokens)?;
 
     let out_path = out_dir.join(output_rel);
-    mk_parent(&out_path)?;
+    paths::mk_parent(&out_path)?;
 
     if fs::exists(&out_path)? {
         bail!("Output file already exists: {}", out_path.display());
@@ -425,7 +454,7 @@ pub fn build_site(opts: BuildOptions) -> Result<std::time::Duration> {
 
         let rel = p.strip_prefix(&in_dir)?.to_path_buf();
 
-        if rel.as_os_str().is_empty() || entry.file_type().is_dir() || is_dot_file(p) {
+        if rel.as_os_str().is_empty() || entry.file_type().is_dir() || paths::is_dot(p) {
             continue;
         }
 
